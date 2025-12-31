@@ -1,59 +1,21 @@
-"""
-功能说明：
-    本脚本用于在 Qwen2-7B-Instruct 模型上进行 LoRA 微调训练。
-    采用 HuggingFace Transformers 与 PEFT 库，结合 4bit 量化加载，
-
-主要流程：
-    1. 自定义 Trainer，支持 labels 并计算因果语言模型的交叉熵损失
-    2. 加载预训练模型与 Tokenizer，配置 4bit 量化
-    3. 准备 LoRA 配置（r=16, alpha=32, dropout=0.05，作用于 q_proj/v_proj）
-    4. 加载已分词的数据集（tokenized dataset）
-    5. 设置 DataCollator，实现动态 padding
-    6. 配置训练参数
-    7. 启动训练并保存 LoRA 权重
-
-输入已分词的数据集目录
-输出LoRA 微调后的权重
-
-可根据硬件条件调整 batch size 与梯度累积步数
-"""
-
+# 03_train_lora.py
+import os
+import torch
+from datasets import load_from_disk
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    Trainer,
     TrainingArguments,
+    Trainer,
     BitsAndBytesConfig,
-    DataCollatorForLanguageModeling
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from datasets import load_from_disk
-import torch
-import torch.nn.functional as F
 
-MODEL_PATH = "qwen2-7b-instruct"
-DATASET_PATH = "data/tokenized"
-OUTPUT_PATH = "adapters/adapter"
+MODEL_PATH   = r"qwen2-7b-instruct"
+DATASET_PATH = r"data/tokenized"
+OUTPUT_PATH  = r"adapters/qwen2-lora"
 
-
-
-class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.get("labels")
-        if labels is None:
-            labels = inputs["input_ids"]
-        outputs = model(**inputs)
-        logits = outputs.get("logits")
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100
-        )
-        return (loss, outputs) if return_outputs else loss
-
-
+# --------- 4bit ---------
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.float16,
@@ -62,6 +24,9 @@ bnb_config = BitsAndBytesConfig(
 )
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
     device_map="auto",
@@ -69,53 +34,72 @@ model = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True
 )
 
-
+# --------- LoRA ---------
 model = prepare_model_for_kbit_training(model)
+
 lora_config = LoraConfig(
     r=16,
     lora_alpha=32,
-    target_modules=["q_proj", "v_proj"],
     lora_dropout=0.05,
     bias="none",
-    task_type="CAUSAL_LM"
+    task_type="CAUSAL_LM",
+    target_modules=[
+        # attention
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        # mlp（Qwen2 常见命名）
+        "gate_proj", "up_proj", "down_proj",
+    ]
 )
 model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
 
+# --------- dataset ---------
+ds = load_from_disk(DATASET_PATH)
 
-tokenized_dataset = load_from_disk(DATASET_PATH)
+# --------- collator: 保留 labels ---------
+def collate_fn(batch):
+    # batch: list of dicts with input_ids/attention_mask/labels
+    max_len = max(len(x["input_ids"]) for x in batch)
 
+    def pad(seq, pad_val):
+        return seq + [pad_val] * (max_len - len(seq))
 
+    input_ids = [pad(x["input_ids"], tokenizer.pad_token_id) for x in batch]
+    attention_mask = [pad(x["attention_mask"], 0) for x in batch]
+    labels = [pad(x["labels"], -100) for x in batch]
 
-data_collator = DataCollatorForLanguageModeling(
-    tokenizer=tokenizer,
-    mlm=False
-)
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+    }
 
-
-training_args = TrainingArguments(
-    per_device_train_batch_size=1,          
-    gradient_accumulation_steps=4,
-    num_train_epochs=3,
-    learning_rate=2e-4,
-    logging_steps=10,
-    fp16=True,
+# --------- training args ---------
+args = TrainingArguments(
     output_dir=OUTPUT_PATH,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    num_train_epochs=3,
+    learning_rate=1e-4,
+    warmup_ratio=0.03,
+    logging_steps=10,
     save_strategy="epoch",
     save_total_limit=2,
+    fp16=True,
     report_to="none",
-    save_on_each_node=True
+    optim="paged_adamw_8bit",
 )
 
-
-trainer = CustomTrainer(
+trainer = Trainer(
     model=model,
-    args=training_args,
-    train_dataset=tokenized_dataset,
-    data_collator=data_collator
+    args=args,
+    train_dataset=ds,
+    data_collator=collate_fn,
 )
 
 trainer.train()
 
-
-model.save_pretrained(training_args.output_dir)
-print(f"LoRA 权重已保存到 {training_args.output_dir}")
+os.makedirs(OUTPUT_PATH, exist_ok=True)
+model.save_pretrained(OUTPUT_PATH)
+tokenizer.save_pretrained(OUTPUT_PATH)  # 可选：方便复现
+print(f"完成：adapter -> {OUTPUT_PATH}")
